@@ -18,6 +18,7 @@ import {
   LibraryProjectGrid,
   LibraryRoute,
   isLibraryProjectDeleteConfirmationValid,
+  libraryAutomationMenuLabel,
   summarizeLibraryProjects,
 } from './library'
 import { getLibraryCoverPreset } from '@/lib/library-covers'
@@ -350,6 +351,32 @@ describe('LibraryRoute presentation', () => {
     expect(html).toContain('完结')
     expect(html).not.toContain('可写作')
     expect(html).not.toContain('未完成')
+  })
+
+  test('shows the current automation mode in the card menu and explains why it can be locked (#27)', () => {
+    expect(libraryAutomationMenuLabel('auto', false)).toBe('自动化：全自动')
+    expect(libraryAutomationMenuLabel('collaborative', false)).toBe('自动化：协作模式')
+    expect(libraryAutomationMenuLabel('auto', true)).toBe('Agent 运行中，不能切换模式')
+  })
+
+  // 菜单本身渲染在 portal 里，静态渲染的卡片 HTML 抓不到——照删除菜单项的先例读源码锁住。
+  test('wires the automation switch as a run-guarded card menu entry that spells out each mode (#27)', () => {
+    const source = readFileSync('src/routes/library.tsx', 'utf8')
+    const anchor = source.indexOf('data-library-project-automation-menu-item="true"')
+
+    expect(anchor).toBeGreaterThan(-1)
+
+    // 取该属性所在的那个 SubTrigger 元素，不认「文件里第一个 SubTrigger」，免得日后加了别的子菜单就测错块。
+    const trigger = source.slice(
+      source.lastIndexOf('<DropdownMenuSubTrigger', anchor),
+      source.indexOf('</DropdownMenuSubTrigger>', anchor),
+    )
+
+    // 与备份/删除同一道闸：Agent 正在跑就不让改档。
+    expect(trigger).toContain('disabled={deleteBlocked}')
+    // 两档各自的后果说明必须挂进选项，不能只给光秃秃的单选项让作者盲选。
+    expect(source).toContain('{LIBRARY_AUTOMATION_LEVEL_HELP.auto}')
+    expect(source).toContain('{LIBRARY_AUTOMATION_LEVEL_HELP.collaborative}')
   })
 
   test('requires the visible title before deleting a project', () => {
