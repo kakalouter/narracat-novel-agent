@@ -12,7 +12,26 @@
 
 产品路线以下方 **Next（产品路线图 · 2026-07-12 统筹版）** 为准：四条泳道 = A 花的所有权（用户编辑）/ B 花的表达权（可配置底座）/ C 尺（评价与验证）/ D 账房（记忆与资产底座）。战略层以 `docs/COMPASS.md` 为准，执行入口 `/next-issue`。
 
-**2026-08-20（#38：损坏项目给作者出路而不是 IPC 黑话，分支 `fix/38-invalid-project-guidance` = `2e46507`，未合并）**：作者录入角色后撞到红条 `Error invoking remote method 'novel:refresh-status': Error: 缺少 .narracat/config.yaml 或 .narracat/state.yaml`。排查结论是**文件并没丢**（复现机四个项目文件全在，也排除了写入竞态——`state-sync.ts` 全程原地覆盖、不存在句柄短暂消失的窗口），真正的问题是三条不需要复现就能修的确定性缺陷。
+**2026-08-20（#37 刀①：durable 事件路径取证 + 换 pi 遗留契约清理，PR #41）**：Agent 过程流频繁「已跳过 调用 read」，取证发现 read 失败率 **25.6%（50/195）**，但错误里的路径被我们自己的脱敏（`agent-durable-events.ts` 的 `ABSOLUTE_PATH`）整段抹成 `[本机路径]`——**根因不可查这件事本身是第一层问题**。改法：脱敏**之前**先把已知根相对化成 `<项目>/…` / `<引擎>/…`，根以上不落盘、根以外照旧整段抹。
+
+**issue 原方案只做脱敏，实测会留 1/3 盲区**：50 次失败里 33 次 ENOENT 的错误串自带路径，另外 **17 次 EISDIR 的错误串根本不含路径**（`EISDIR: illegal operation on a directory, read`，到此为止），唯一带路径的是 `tool.started` 的 `input`，而 sink 的 `tools` Map 只存 `{messageId,toolName,title}`、input 被丢弃。故落盘事件新增可选 `target`：在 started 时取出路径、相对化后存进 live 投影，收尾事件再写出。**只改脱敏对 EISDIR 那一类无效**，会再来一轮。
+
+**已知根经装配层注入**（`ipc/agent.ts` → coordinator → sink），与 run-manager / pi adapter 共用同一份 `resolveNarraCatAgentCorePath({appRoot, resourcesPath})`（均不传 `envPath`），避免两处算出不同引擎根。**根为空时功能不报错、不失败，只是落盘里照旧 `[本机路径]` 而单测全绿**——这类静默失效只能在装配处拦，故加了装配层源码断言。
+
+**测试覆盖的边界**：兄弟目录前缀误伤（`/novel-x` 不得吃掉 `/novel-x-backup`，最初实现真踩了，落盘会变成 `<项目>-backup`）、Windows 两侧分隔符不一致（配置里 `/`、Node 错误串里 `\`，按字面匹配整条漏掉 = Windows 上取证等于没做）、项目外路径仍被抹、存量事件缺 `target` 字段仍可读。验证：typecheck / 全量 **3053 pass 0 fail**（对 main 基线 3043/301 为 **+10 tests +2 files**，核对过文件数不是静默跳过）/ check:design / check:architecture / build 全绿；启动烟测正常，dev 下引擎根解析为真实存在目录并验证相对化生效。
+
+**真机 dogfood 打脸（2026-08-20）：跑完一章，target 字段一个都没有，而全部单测照样绿。** 根因是字段名搞错——最初照搬 `tool-phrase.ts` 的 `['file_path','filePath']`，那是 claude-sdk 时代的契约（工具名还是大写 `Read`）；换 pi 后工具名变小写、参数名变 `path`，`extractToolTargetPath` 于是永远返回 undefined。取证走 pi 的 `sessions/*.jsonl`（工具调用的完整入参本来就落在那里）：`read {path,offset}` / `write {path,content}` / `find {path,pattern}` / `grep {pattern,path,context}`，四个工具一律 `path`，无一使用 `file_path`。
+
+**最刺眼的一点**：`pi-tool-guard.ts` 第 45 行注释早就写着「路径字段受圈禁的 pi 内置工具（**字段全叫 path**）」，同文件的 `SDK_TO_PI_TOOL_NAME` 就是权威映射表（含 `Glob → find` 这个改名）。**先读那个文件，这个 bug 一个都不会有。**「复用同仓已有常量」看起来是对的工程直觉，实际是从一份过期契约里抄答案；而测试与实现共用同一个错误假设（用例全用 `{file_path}` 构造），所以全绿也挡不住。修复同时把 sink 测试的 input 改成 `{path}`——原来的形态在真实系统里根本不存在，测试等于在验证虚构场景。
+
+**同源副产品（已一并修）**：`tool-phrase.ts` 的 `Read`/`Write`/`Grep`/`Glob` 四个 case 在 pi 下全是死代码，工具卡文案静默退化——作者看到的不是「读取 config.yaml」而是 default 分支兜底吐的 **`read config.yaml`**（英文工具标识直接糊脸）。旧的大写 case 保留（fall-through），因为存量会话事件里存的是 SDK 名，重看旧对话仍要正确渲染；另补 `ls` 与 `AskUserQuestion`。守卫测试第一版只挡「调用 <name>」，**漏掉了「<name> <值>」这种形态，红一次才发现**——退化不止一种长相。
+
+**最终真机验证通过**：`find → <项目>`、`read → <项目>/manuscript/vol-01/ch-001.md`、`read → <项目>/outline/vol-01/ch-001.md`、`find → <项目>/.narracat/manuscript-drafts`；`bash → 无 target`（正确，它用 command 不用 path）。相对化同批验证：`ENOENT ... access '<项目>/.narracat/staging/ch-019.md'`。
+
+**给 ③ 的第一条线索**：本次跑章 read 失败 5 次 = 3 次 EISDIR（错误串不带路径）+ 2 次 ENOENT 指向 `<项目>/.narracat/staging/ch-0XX.md`，**agent 在读还没生成的 staging 文件**。注意本批 read 失败率 10.4%（43/5）与历史 25.6%（145/50）不可直接对比——本次改动没有触碰 read 行为，差异不能归因于它。
+
+**待办**：#37 的 ②（过程流区分「跳过」与「失败」）与 ③（系统性打空的根因）。③ 现在有了带路径的取证数据，但仍**不能凭猜改 prompt**——需要更多样本确认 staging 那条线索是不是主因。
+**2026-08-20（#38：损坏项目给作者出路而不是 IPC 黑话，PR #40 已合 main）**：作者录入角色后撞到红条 `Error invoking remote method 'novel:refresh-status': Error: 缺少 .narracat/config.yaml 或 .narracat/state.yaml`。排查结论是**文件并没丢**（复现机四个项目文件全在，也排除了写入竞态——`state-sync.ts` 全程原地覆盖、不存在句柄短暂消失的窗口），真正的问题是三条不需要复现就能修的确定性缺陷。
 
 **① 入口没拦**：书架明知这本书坏了、卡上都标了红，`<Link>` 仍覆盖整卡照常可点，进去必撞 `aggregateNovelStatusSnapshot` 第一行。改成点击弹说明浮层。**主动作定为「打开所在文件夹」而不是删除**——invalid 很可能是误判（文件夹被移动/重命名、外置盘没插、config.yaml 被误删而正文还在），这种时候引导作者删东西是灾难。
 
