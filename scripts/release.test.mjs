@@ -8,11 +8,14 @@ import {
   assertArtifactsNotStale,
   assertArtifactsNotarized,
   assertInteractive,
+  assertVersionNotAlreadyReleased,
   assertZipMatchesManifest,
   assertManifestMatchesVersion,
   createReleasePlan,
   formatConfirmation,
+  parseReleaseArgs,
   publishRelease,
+  readReleaseState,
 } from './release.mjs'
 import { releaseAssetFileNames } from './update-feed.mjs'
 
@@ -331,5 +334,129 @@ describe('复用现成产物的三道加严闸（--use-existing-artifacts）', (
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('版本号重复闸（ADR-0038 补的第二道）', () => {
+  // 派生时代版本号只增不减、天然不可能重复；改成人在 package.json 里定之后，「忘了 bump 就发版」
+  // 成了真实可能，而它**不报错**——资产会被 --clobber 传进已发布的 tag，线上文件被悄悄换掉、
+  // 版本号没变，electron-updater 完全无感。这一组就是那道闸。
+
+  test('tag 不存在：放行（正常发版路径）', () => {
+    expect(() =>
+      assertVersionNotAlreadyReleased('0.3.0', { readState: () => null }),
+    ).not.toThrow()
+  })
+
+  test('tag 存在但停在 draft：放行，交给既有的恢复引导', () => {
+    // draft 是上次发版中途某个资产上传失败的残留，与「忘了 bump」是两回事：
+    // draft 不被匿名 API 与 releases/latest 看见，线上仍是上一版，重跑是安全的。
+    expect(() =>
+      assertVersionNotAlreadyReleased('0.3.0', { readState: () => ({ isDraft: true }) }),
+    ).not.toThrow()
+  })
+
+  test('tag 已发布：fail-loud，并指出多半是忘了抬版本号', () => {
+    let error
+    try {
+      assertVersionNotAlreadyReleased('0.3.0', { readState: () => ({ isDraft: false }) })
+    } catch (caught) {
+      error = caught
+    }
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toContain('v0.3.0')
+    expect(error.message).toContain('package.json')
+    // 报错必须给出下一步怎么办，否则撞上的人只能来读源码
+    expect(error.message).toContain('0.3.1')
+    expect(error.message).toContain('release delete')
+  })
+
+  test('传给闸的是 tag 而不是裸版本号（少一个 v 就查错对象、恒放行）', () => {
+    const seen = []
+    assertVersionNotAlreadyReleased('0.3.0', {
+      readState: (tag) => {
+        seen.push(tag)
+        return null
+      },
+    })
+
+    expect(seen).toEqual(['v0.3.0'])
+  })
+
+  test('readReleaseState：gh 报错（tag 不存在）时返回 null，不把发版流程炸掉', () => {
+    expect(
+      readReleaseState('v9.9.9', {
+        execFile: () => {
+          throw new Error('release not found')
+        },
+      }),
+    ).toBeNull()
+  })
+
+  test('readReleaseState：正常返回时解析出 isDraft', () => {
+    expect(
+      readReleaseState('v0.3.0', { execFile: () => JSON.stringify({ isDraft: true }) }),
+    ).toEqual({ isDraft: true })
+  })
+})
+
+describe('发版覆盖平台必须显式声明', () => {
+  // 「不给参数就只发 mac」这个默认在只有 mac 的时代是对的；Windows 成为正式分发平台后
+  // 它变成静默陷阱——命令照常成功，只是这一版没有 Windows 包，Windows 用户静默跳过、
+  // 收不到更新也不知道为什么。失败的表现不是报错，是安静地少做一件事。
+
+  test('什么都不给：炸，并把两条正确用法都写出来', () => {
+    let error
+    try {
+      parseReleaseArgs(['node', 'release.mjs'])
+    } catch (caught) {
+      error = caught
+    }
+
+    expect(error).toBeInstanceOf(Error)
+    expect(error.message).toContain('--with-win')
+    expect(error.message).toContain('--mac-only')
+    // 只说「不许」没用，必须告诉人怎么拿到 Windows 产物
+    expect(error.message).toContain('windows-release-build.yml')
+    // 选了只发 mac 的真实代价要当场说清楚：不是「停在上一版」，是更新链断掉
+    expect(error.message).toContain('releases/latest')
+    expect(error.message).toContain('404')
+  })
+
+  test('--mac-only：放行，winDir 为空（这是主动选择，不是默认）', () => {
+    expect(parseReleaseArgs(['node', 'release.mjs', '--mac-only'])).toEqual({
+      winDir: undefined,
+      useExistingArtifacts: false,
+    })
+  })
+
+  test('--with-win <目录>：放行，目录解析成绝对路径', () => {
+    const parsed = parseReleaseArgs(['node', 'release.mjs', '--with-win', '/tmp/win-artifacts'])
+
+    expect(parsed.winDir).toBe('/tmp/win-artifacts')
+    expect(parsed.useExistingArtifacts).toBe(false)
+  })
+
+  test('两个都给：矛盾指令，炸而不是猜', () => {
+    expect(() =>
+      parseReleaseArgs(['node', 'release.mjs', '--mac-only', '--with-win', '/tmp/win']),
+    ).toThrow('互斥')
+  })
+
+  test('--with-win 缺值仍然炸——后面跟另一个 flag 不算取值', () => {
+    // 静默退化成「只发 mac」正是本组要杜绝的
+    expect(() =>
+      parseReleaseArgs(['node', 'release.mjs', '--with-win', '--use-existing-artifacts']),
+    ).toThrow('--with-win 缺少取值')
+    expect(() => parseReleaseArgs(['node', 'release.mjs', '--with-win'])).toThrow(
+      '--with-win 缺少取值',
+    )
+  })
+
+  test('--use-existing-artifacts 与覆盖平台正交', () => {
+    expect(
+      parseReleaseArgs(['node', 'release.mjs', '--mac-only', '--use-existing-artifacts']),
+    ).toEqual({ winDir: undefined, useExistingArtifacts: true })
   })
 })

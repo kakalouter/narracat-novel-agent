@@ -9,7 +9,49 @@
 - Target: macOS arm64
 - Artifact: DMG plus unpacked `.app`
 - Artifact naming: `NarraCat-${version}-mac-arm64`
-- Client build version: `0.2.<release commit count>` from `scripts/client-build-version.mjs` (line prefix = `CLIENT_BUILD_VERSION_PREFIX`; raised `0.1` → `0.2` on 2026-08-25, see ADR-0006 amendment — a `0.1.x` cut would rank below the shipped `v0.1.1930` and reach nobody)
+- Client version: `package.json`'s `version`, decided by a human at release time (ADR-0038; superseded the commit-count derivation of ADR-0006). Resolved through `scripts/client-version.mjs`; must be strictly greater than `HIGHEST_SHIPPED_VERSION` or those machines never see the update.
+
+## Step 0 — Decide The Version
+
+**This is now the first step of a release, not a by-product of packaging.** Bump `package.json`'s
+`version` (patch for fixes, minor for new capability), commit it, and only then package. Forgetting
+this is caught before packaging by `release.mjs`'s duplicate-version gate — but catching it early
+saves a signing + notarization round. After the release ships, raise `HIGHEST_SHIPPED_VERSION` in
+`scripts/client-version.mjs` to the version you just shipped.
+
+Both platforms read the same `package.json`, so mac and Windows artifacts carry the same version
+by construction — that is the point of ADR-0038.
+
+## Step 1 — Decide The Platforms (mandatory, no default)
+
+The two platforms are built on separate paths and merged into one Release:
+
+| Platform | Built where | Why only there |
+| --- | --- | --- |
+| macOS arm64 | this Mac | signing reads the Developer ID cert from the local Keychain, then Apple notarization |
+| Windows x64 | GitHub CI | mac cannot cross-build a working Windows package (keytar / better-sqlite3 are mac-native binaries), and SignPath requires a verifiable build from source |
+
+```bash
+# 1. Windows artifacts (≈5 min), then download the three files from the Actions run
+gh workflow run windows-release-build.yml --ref main
+
+# 2. Package mac + publish both platforms into one Release
+bun --no-cache run release --with-win <dir with the three CI artifacts>
+```
+
+`release` **refuses to run without `--with-win <dir>` or `--mac-only`.** Shipping mac-only used to be
+the silent default; once Windows became a real distribution target that default turned into a trap —
+and a worse one than "one package missing":
+
+**Both platforms' update manifests resolve to `releases/latest`** (see `workers/narracat-update`:
+`latest-mac.yml` and `latest.yml` both map to `releases/latest/download/<manifest>`). A release
+carrying only one platform's artifacts becomes `latest`, and the *other* platform's manifest lookup
+then 404s — that update channel is broken until the next release that includes it. Not "users stay
+one version behind": they stop receiving updates entirely, with no error on either end.
+
+**So once both platforms have users, every release must ship both.** `--mac-only` exists for the
+current state (Windows never published yet) and for the emergency case where Windows CI cannot
+produce a package and a mac hotfix cannot wait.
 
 ## Automatic Gate
 
@@ -26,7 +68,7 @@ bun --no-cache run build
 bun --no-cache run package
 ```
 
-`bun --no-cache run package` computes the client build version from the current release commit, verifies and prepares NarraCat Agent Core, probes the staged runtime, builds Electron bundles, packages the macOS arm64 DMG, and smokes the packaged app.
+`bun --no-cache run package` reads the client version from `package.json`, verifies and prepares NarraCat Agent Core, probes the staged runtime, builds Electron bundles, packages the macOS arm64 DMG, and smokes the packaged app.
 
 Do not use an upstream NarraCat checkout during RC packaging. RC packaging uses the internal `agent-core/narracat` source and packages it as `NarraCatAgentCore`.
 
@@ -35,7 +77,7 @@ Do not use an upstream NarraCat checkout during RC packaging. RC packaging uses 
 Use the unpacked `.app` produced beside the DMG:
 
 1. Launch the unpacked `NarraCat.app`.
-2. Open Settings and confirm the client version matches `node scripts/client-build-version.mjs`.
+2. Open Settings and confirm the client version matches `node scripts/client-version.mjs`.
 3. Confirm NarraCat Agent Core diagnostics report the locked Agent Core version.
 4. Create a temporary Novel project from Library.
 5. Open the created Workbench.
