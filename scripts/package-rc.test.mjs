@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -9,6 +9,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   assertCorpusCredentials,
   assertNotarizeCredentials,
+  BIN_ENTRIES,
   createPackageRcSteps,
   findMissingCorpusEnv,
   findMissingNotarizeEnv,
@@ -17,11 +18,13 @@ import {
   resolvePackageClientVersion,
   restoreSourceManifestIfClobbered,
   resolveStepEnv,
+  runPackageRc,
 } from './package-rc.mjs'
 import { CLIENT_BUILD_VERSION_RE } from './client-build-version.mjs'
 import { DEFAULT_APP_PATH } from './verify-signed-artifact.mjs'
 
 const packageRcModuleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), 'package-rc.mjs')).href
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 /**
  * 在临时目录（永远不是仓库根目录）里演练 package-rc.mjs 真实的 loadEnvFiles()。
@@ -44,7 +47,7 @@ async function runLoadEnvFilesInSubprocess(tmpDir) {
 
 describe('RC package script', () => {
   test('builds the macOS arm64 RC with the derived client build version', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.42' })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.42', platform: 'darwin' })
 
     expect(steps.map((step) => step.label)).toEqual([
       'verify Developer ID signing identity',
@@ -81,12 +84,110 @@ describe('RC package script', () => {
   })
 })
 
+describe('依赖入口解析（跨平台）', () => {
+  // Windows 上 node_modules/.bin 放的是 .cmd 批处理，而 Node 官方文档写死
+  //「.bat/.cmd 不能用 execFile 启动」——直接 spawnSync EINVAL。改用 node 跑包的
+  // JS 入口后跨平台一致，但入口路径成了硬依赖：升级依赖时它变了必须当场红。
+  test('登记的入口与各包 package.json 的 bin 字段一致，且文件真实存在', () => {
+    for (const [name, entry] of Object.entries(BIN_ENTRIES)) {
+      const pkg = JSON.parse(readFileSync(join(repoRoot, 'node_modules', name, 'package.json'), 'utf8'))
+      const declared = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin[name]
+      expect(join(name, ...declared.replace(/^\.?\//, '').split('/'))).toBe(entry)
+      expect(existsSync(join(repoRoot, 'node_modules', entry))).toBe(true)
+    }
+  })
+
+  test('打包步骤一律用 node 跑入口，不出现 node_modules/.bin', () => {
+    for (const platform of ['darwin', 'win32']) {
+      for (const step of createPackageRcSteps({ clientVersion: '0.1.9999', platform })) {
+        expect(step.command).not.toContain(`.bin`)
+        expect(step.args.some((arg) => String(arg).includes('.bin'))).toBe(false)
+      }
+    }
+  })
+})
+
+describe('Windows 打包档（Windows 战役 2026-08-16）', () => {
+  const winSteps = () => createPackageRcSteps({ clientVersion: '0.1.1880', platform: 'win32' })
+
+  test('不跑任何 macOS 专有的签名 / 公证步骤', () => {
+    const labels = winSteps().map((step) => step.label)
+    expect(labels.some((label) => label.includes('signing identity'))).toBe(false)
+    expect(labels.some((label) => label.includes('notarize'))).toBe(false)
+    expect(labels.some((label) => label.includes('verify signed artifact'))).toBe(false)
+  })
+
+  test('electron-builder 传 --win nsis --x64', () => {
+    const build = winSteps().find((step) => step.label.includes('package Windows'))
+    expect(build.args).toContain('--win')
+    expect(build.args).toContain('nsis')
+    expect(build.args).toContain('--x64')
+    expect(build.args).toContain('--config.extraMetadata.version=0.1.1880')
+  })
+
+  // better-sqlite3 13 是 N-API，prebuilds/win32-x64.node 通吃 node 与 Electron，
+  // 让 electron-builder 拉 node-gyp 重编纯属多余，且在 Windows CI 上会直接失败。
+  test('关掉 npmRebuild（mac 档不动）', () => {
+    const build = winSteps().find((step) => step.label.includes('package Windows'))
+    expect(build.args).toContain('--config.npmRebuild=false')
+
+    const macBuild = createPackageRcSteps({ clientVersion: '0.1.1880', platform: 'darwin' }).find((step) =>
+      step.label.includes('package macOS'),
+    )
+    expect(macBuild.args.some((arg) => String(arg).includes('npmRebuild'))).toBe(false)
+  })
+
+  test('stage 与 audit 都收到 --platform win32（否则会裁光 win 二进制 / 找错产物目录）', () => {
+    const steps = winSteps()
+    const stage = steps.find((step) => step.label.includes('stage NarraCat Agent Core'))
+    expect(stage.args).toContain('--platform')
+    expect(stage.args).toContain('win32')
+    const audit = steps.find((step) => step.label.includes('audit packaged app boundary'))
+    expect(audit.args).toContain('--platform')
+    expect(audit.args).toContain('win32')
+  })
+
+  // smoke packaged app 要真启动 GUI，而 Windows 出包走 CI、流水线从不启动界面；
+  // 且它的 NARRACAT_SMOKE_ELECTRON_BIN 硬编码 mac 的 .app 路径。Windows 侧的产物级
+  // 验证由实体机冷启动走查人工承担。
+  test('Windows 档不含 smoke packaged app（那是 mac 档专属的后置防线）', () => {
+    expect(winSteps().some((step) => step.label === 'smoke packaged app')).toBe(false)
+  })
+
+  // 反向钉死：staged 探针是两平台共享的前置防线，拆 shared 步骤时不能把它一起丢了。
+  test('Windows 档保留 staged 探针（纯命令行，可进 CI）', () => {
+    const labels = winSteps().map((step) => step.label)
+    expect(labels).toContain('probe staged Agent Core runtime')
+    expect(labels.indexOf('probe staged Agent Core runtime')).toBeLessThan(
+      labels.findIndex((label) => label.includes('package Windows')),
+    )
+  })
+
+  test('mac 档一字不变：签名闸第一、产物冒烟仍在', () => {
+    const macSteps = createPackageRcSteps({ clientVersion: '0.1.1880', platform: 'darwin' })
+    expect(macSteps[0].label).toBe('verify Developer ID signing identity')
+    const smoke = macSteps.find((step) => step.label === 'smoke packaged app')
+    expect(smoke).toBeDefined()
+    expect(smoke.env.NARRACAT_SMOKE_REQUIRE_PACKAGED).toBe('1')
+  })
+
+  test('不支持的平台 fail-loud', () => {
+    expect(() => createPackageRcSteps({ clientVersion: '0.1.1880', platform: 'linux' })).toThrow(
+      /不支持的打包目标平台/,
+    )
+  })
+
+  test('Windows 档无条件要求语料 token（没有公证档可以挂钩）', () => {
+    expect(() => runPackageRc({ platform: 'win32', env: {} })).toThrow(/语料服务凭证缺失/)
+  })
+})
+
 describe('两道运行时防线（staged 探针 + 产物冒烟）', () => {
   // 两者验的不是同一个二进制：探针在打包前用当前 Node 跑暂存树（引擎自带的 node-ABI
   // better-sqlite3，跨平台、可进 Windows CI）；冒烟在打包后启动产物 .app，走生产实际路径
   // （根 node_modules 的 Electron-ABI better-sqlite3 + utilityProcess）。少任何一条都留缺口。
   test('冒烟跑在打包之后，且 electron 二进制指向本次产物 .app', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.9999' })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', platform: 'darwin' })
     const labels = steps.map((step) => step.label)
     const smoke = steps.find((step) => step.label === 'smoke packaged app')
 
@@ -101,21 +202,21 @@ describe('两道运行时防线（staged 探针 + 产物冒烟）', () => {
   })
 
   test('探针排在打包之前（早失败：暂存树坏了不该先烧几分钟打包）', () => {
-    const labels = createPackageRcSteps({ clientVersion: '0.1.9999' }).map((step) => step.label)
+    const labels = createPackageRcSteps({ clientVersion: '0.1.9999', platform: 'darwin' }).map((step) => step.label)
     expect(labels.indexOf('probe staged Agent Core runtime')).toBeLessThan(
       labels.findIndex((label) => label.includes('package macOS')),
     )
   })
 
   test('探针步骤本身不带 env 覆盖，冒烟才需要（避免有人顺手给探针塞 electron 二进制）', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.9999' })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', platform: 'darwin' })
     const probe = steps.find((step) => step.label === 'probe staged Agent Core runtime')
     expect(probe.env).toBeUndefined()
   })
 
   // 冒烟必须排在 audit 之后（文档如此写，且 audit 是只读静态检查、该先拦）
   test('冒烟排在 audit packaged app boundary 之后', () => {
-    const labels = createPackageRcSteps({ clientVersion: '0.1.9999' }).map((step) => step.label)
+    const labels = createPackageRcSteps({ clientVersion: '0.1.9999', platform: 'darwin' }).map((step) => step.label)
     expect(labels.indexOf('smoke packaged app')).toBeGreaterThan(labels.indexOf('audit packaged app boundary'))
   })
 
@@ -123,7 +224,7 @@ describe('两道运行时防线（staged 探针 + 产物冒烟）', () => {
   // 而 dev 回落的日志输出与跑真产物**逐字相同**（resolveEmbeddingModelPath 同样命中打包链刚
   // prepare 好的 build/embedding-model），事后无从分辨。REQUIRE_PACKAGED 让这种情况硬失败。
   test('冒烟带 REQUIRE_PACKAGED 硬闸，env 没传到时不会静默回落 dev 态', () => {
-    const smoke = createPackageRcSteps({ clientVersion: '0.1.9999' }).find(
+    const smoke = createPackageRcSteps({ clientVersion: '0.1.9999', platform: 'darwin' }).find(
       (step) => step.label === 'smoke packaged app',
     )
     expect(smoke.env.NARRACAT_SMOKE_REQUIRE_PACKAGED).toBe('1')
@@ -156,7 +257,7 @@ describe('步骤 env 合并（外审变异 M4：叠加不得退化成替换）',
 
 describe('release 档：dmg 容器公证步骤', () => {
   test('release 档在 audit 之后、verify 之前插入 notarize dmg container', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: true })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: true, platform: 'darwin' })
     expect(steps.map((step) => step.label)).toEqual([
       'verify Developer ID signing identity',
       'check node runtime',
@@ -181,14 +282,14 @@ describe('release 档：dmg 容器公证步骤', () => {
   })
 
   test('默认档不含 notarize dmg container 步骤', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: false })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: false, platform: 'darwin' })
     expect(steps.some((step) => step.label === 'notarize dmg container')).toBe(false)
   })
 })
 
 describe('打包分档：签名 / 签名+公证', () => {
   test('默认档不公证，产出 dmg + zip', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.9999' })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', platform: 'darwin' })
     const builder = steps.find((step) => step.label.includes('package macOS'))
     expect(builder.args).toContain('dmg')
     expect(builder.args).toContain('zip')
@@ -196,14 +297,14 @@ describe('打包分档：签名 / 签名+公证', () => {
   })
 
   test('release 档开启公证', () => {
-    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: true })
+    const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: true, platform: 'darwin' })
     const builder = steps.find((step) => step.label.includes('package macOS'))
     expect(builder.args).toContain('--config.mac.notarize=true')
   })
 
   test('打包后的收尾校验步骤随档位带上 --notarized（release 档才验公证与票据装订）', () => {
-    const releaseSteps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: true })
-    const defaultSteps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: false })
+    const releaseSteps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: true, platform: 'darwin' })
+    const defaultSteps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize: false, platform: 'darwin' })
     const releaseVerify = releaseSteps.find((step) => step.label === 'verify signed artifact')
     const defaultVerify = defaultSteps.find((step) => step.label === 'verify signed artifact')
     expect(releaseVerify.args).toContain('--notarized')
@@ -218,7 +319,7 @@ describe('打包分档：签名 / 签名+公证', () => {
 
   test('两档都先过签名身份硬闸', () => {
     for (const notarize of [false, true]) {
-      const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize })
+      const steps = createPackageRcSteps({ clientVersion: '0.1.9999', notarize, platform: 'darwin' })
       const gate = steps.findIndex((step) => step.args.some((arg) => String(arg).endsWith('check-signing-identity.mjs')))
       const builder = steps.findIndex((step) => step.label.includes('package macOS'))
       expect(gate).toBeGreaterThanOrEqual(0)
