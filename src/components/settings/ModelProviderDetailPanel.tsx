@@ -9,7 +9,7 @@ import { cn } from '@/lib/cn'
 import { isEntryVerified, modelEntryKey } from '@shared/lib/model-slots'
 import type { WireId } from '@shared/types/config'
 import type { AppConfig, ConnectionTestResult, ModelPoolEntry, ProviderId } from '@shared/types/ipc'
-import { MODEL_CATALOG, MODEL_PROVIDERS } from './model-providers'
+import { canListModels, MODEL_CATALOG, MODEL_PROVIDERS } from './model-providers'
 
 /**
  * 渠道详情二级页（渠道两级 UI v2 T4）：四分组——Key 与连接 / 接口协议与地址 / 模型列表 / 添加自定义模型。
@@ -93,7 +93,7 @@ export function ModelProviderDetailPanel({
         <SettingsRow
           align="start"
           title="API Key"
-          description={hasSavedKey ? '输入新 Key 会在保存时覆盖当前值' : '仅保存到系统钥匙串'}
+          description={hasSavedKey ? '输入新 Key 会在保存时覆盖当前值' : '仅保存到系统凭据库'}
         >
           <div className="grid gap-2">
             <div className="flex items-center gap-2">
@@ -134,23 +134,6 @@ export function ModelProviderDetailPanel({
                 <span>已保存当前服务商的 Key</span>
               </div>
             ) : null}
-          </div>
-        </SettingsRow>
-
-        <SettingsRow align="start" title="连接" description="用当前 Key 与已启用模型发一次真实测试请求">
-          <div className="grid gap-2">
-            <Button
-              type="button"
-              size="sm"
-              aria-label="测试连接"
-              disabled={testDisabled}
-              title={testTitle}
-              onClick={() => void onTestConnection()}
-            >
-              {testing ? <Loader2 className="size-3.5 animate-spin" /> : <Wifi className="size-3.5" />}
-              测试连接
-            </Button>
-            <TestResultLine testResult={testResult} channelVerified={channelVerified} />
           </div>
         </SettingsRow>
       </section>
@@ -231,16 +214,19 @@ export function ModelProviderDetailPanel({
             </div>
             {fetchError ? <p className="mt-1 text-xs text-muted-foreground">{fetchError}</p> : null}
           </div>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={busy || fetchingModels}
-            onClick={() => void onRefreshModels()}
-          >
-            <RefreshCw className={cn('size-3.5', fetchingModels && 'animate-spin')} />
-            刷新清单
-          </Button>
+          {canListModels(provider) ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              data-model-refresh="true"
+              disabled={busy || fetchingModels}
+              onClick={() => void onRefreshModels()}
+            >
+              <RefreshCw className={cn('size-3.5', fetchingModels && 'animate-spin')} />
+              刷新清单
+            </Button>
+          ) : null}
         </div>
 
         {rows.map((modelId) => (
@@ -271,6 +257,27 @@ export function ModelProviderDetailPanel({
             <Button type="button" size="sm" disabled={busy || addDisabled} onClick={handleAdd}>
               添加
             </Button>
+          </div>
+        </SettingsRow>
+      </section>
+
+      {/* 「测试连接」恒为最后一个分组：它要用到上面全部配置（Key、端点、已启用模型），
+          排在中间会让用户在还没选模型时就去点它。分组顺序即配置顺序。 */}
+      <section className={GROUP_CLASS} data-model-connection="true">
+        <SettingsRow align="start" title="连接" description="用当前 Key 与已启用模型发一次真实测试请求">
+          <div className="grid gap-2">
+            <Button
+              type="button"
+              size="sm"
+              aria-label="测试连接"
+              disabled={testDisabled}
+              title={testTitle}
+              onClick={() => void onTestConnection()}
+            >
+              {testing ? <Loader2 className="size-3.5 animate-spin" /> : <Wifi className="size-3.5" />}
+              测试连接
+            </Button>
+            <TestResultLine testResult={testResult} channelVerified={channelVerified} />
           </div>
         </SettingsRow>
       </section>
