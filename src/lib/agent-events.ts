@@ -9,6 +9,7 @@ import type {
   AgentThread,
   AgentTokenUsage,
 } from '@shared/types/agent'
+import { resolveRunVisiblePrompt } from '@shared/lib/run-visible-prompt'
 
 export function createEmptyAgentThread(id: string): AgentThread {
   return {
@@ -123,7 +124,7 @@ function createToolCompletionPatch(event: ToolCompletedEvent): ToolPatch {
 }
 
 function startRun(thread: AgentThread, event: RunStartedEvent): AgentThread {
-  const visiblePrompt = getVisibleRunPrompt(event)
+  const visiblePrompt = resolveRunVisiblePrompt(event)
   const userMessage: AgentMessage = {
     id: `user-${event.runId}`,
     role: 'user',
@@ -166,21 +167,6 @@ function startRun(thread: AgentThread, event: RunStartedEvent): AgentThread {
       target: event.target,
     },
   }
-}
-
-function getVisibleRunPrompt(event: RunStartedEvent): string {
-  // 显式干净文案优先：空页/预设动作把定位元信息塞进 prompt 给 Agent，气泡只显示 displayPrompt。
-  const displayPrompt = event.displayPrompt?.trim()
-  if (displayPrompt) return displayPrompt
-
-  if ((event.command === 'review' || event.command === 'rewrite') && event.selectedChapter) {
-    const promptIsChapterArgument = event.prompt.trim() === String(event.selectedChapter)
-    if (promptIsChapterArgument) {
-      return `${event.command === 'review' ? '审修' : '重写'}第 ${event.selectedChapter} 章`
-    }
-  }
-
-  return event.prompt
 }
 
 function appendTextDelta(message: AgentMessage, text: string): AgentMessage {
