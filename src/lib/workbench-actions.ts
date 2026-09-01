@@ -353,6 +353,25 @@ export function createWriteCurrentChapterAction(target?: WorkbenchActionTarget, 
   }
 }
 
+/**
+ * 「去写第 N 章」：用户点开的不是当前应写章节时，空态给一条回到当前章的路。
+ *
+ * 在这之前该空态只有一句「轮到本章时，这里会提供写作入口」、没有任何按钮——遥测显示 25 台设备
+ * 建完立项卡后在各模块间逛了几小时却一次都没写，写作入口需要「点进正好是当前章的那一章」才出现，
+ * 是这条死胡同的一部分。这里只做导航（kind: 'client'），真正的写作动作仍由当前章空态的
+ * createWriteCurrentChapterAction 提供，两者职责不混。
+ */
+export function createGoToCurrentChapterAction(currentChapterId: string, chapterNumber?: number | null): WorkbenchAction {
+  return {
+    id: 'go-to-current-chapter',
+    kind: 'client',
+    label: chapterNumber && chapterNumber > 0 ? `去写第 ${chapterNumber} 章` : '去当前章',
+    description: '跳到当前应该写的章节。',
+    enabled: true,
+    target: { sectionId: 'blueprint', tabId: currentChapterId, objectId: currentChapterId },
+  }
+}
+
 export function createRecoverCurrentChapterAction(target?: WorkbenchActionTarget): WorkbenchAction {
   return {
     id: 'recover-current-chapter',
@@ -442,15 +461,40 @@ function statusChapterTarget(chapter: number): WorkbenchActionTarget {
 }
 
 /**
- * 状态页生命周期 stepper 的当前阶段下标（0 立项 / 1 大纲 / 2 连载 / 3 完结）。
+ * 状态页生命周期 stepper 的当前阶段下标（0 立项 / 1 设定 / 2 大纲 / 3 连载 / 4 完结）。
  * 项目无效 / 缺失时返回 null（不渲染 stepper）。
  */
+/**
+ * 创作链里「立项卡之后、大纲之前」那一格：有了立项卡但一个角色档案都还没有。
+ *
+ * stepper 的阶段下标与当前任务指针**共用这一处判定**——两边各写一遍 status + hasCharacters
+ * 的话，改一处漏一处就会出现「指针让去建角色、stepper 显示已经在大纲」这类自相矛盾
+ * （本轮外审正是抓到这个漂移风险）。判据本身与引擎 plan.md 的前置检查对齐。
+ */
+function needsCharacterSettings(project: NovelProjectDetail): boolean {
+  return project.status === 'needs-outline' && !project.hasCharacters
+}
+
+/**
+ * 这一步是「只建议、可跳过」的吗。指针据此显示「可跳过」标记——ADR-0040 说可跳过要体现在
+ * 文案上，但那句话原先只写在 action.description 里，而指针从不渲染 description，
+ * 作者看到的只有命令式的 label。
+ */
+const OPTIONAL_NEXT_STEP_IDS: ReadonlySet<string> = new Set(['status-next-world'])
+
+export function isOptionalNextStep(action: WorkbenchAction): boolean {
+  return OPTIONAL_NEXT_STEP_IDS.has(action.id)
+}
+
 export function resolveStatusLifecycleIndex(project: NovelProjectDetail | null, nextStep: StatusNextStep): number | null {
   if (!project || project.status === 'invalid') return null
   if (project.status === 'needs-setup') return 0
-  if (project.status === 'needs-outline') return 1
-  if (nextStep?.kind === 'done') return 3
-  return 2
+  // 「设定」（世界观与角色）独立成格。跳过它的作者不会卡住——直接做大纲会让 status 进 ready，
+  // stepper 顺势推到「连载」，之前的格子一律显示为已走过（stepper 表达的是「当前在哪一阶段」，
+  // 不是逐项打卡）。
+  if (project.status === 'needs-outline') return needsCharacterSettings(project) ? 1 : 2
+  if (nextStep?.kind === 'done') return 4
+  return 3
 }
 
 export function resolveStatusNextStep(project: NovelProjectDetail | null): StatusNextStep {
@@ -470,6 +514,28 @@ export function resolveStatusNextStep(project: NovelProjectDetail | null): Statu
         // 落到设定集「核心前提」tab：bible-premise 是真实可解析的 settings tab；
         // foundation 是聚合对象、不在 settings tabs 中，会 fallback 成裸 object 链接落回 blueprint。
         target: settingsTabTarget('bible-premise'),
+      },
+    }
+  }
+
+  // 创作链缺「世界观与角色」这一格时先建议补上（ADR-0040）。引擎 plan.md 的前置检查会问同一句
+  // （无角色文件 → 「先去 world 创建主要角色 / 继续规划」），指针不先说，就会出现「指针推一下、
+  // 引擎拦一下」的自相矛盾。判据与 plan.md 逐字对齐：只看 bible/characters 下有没有 .md。
+  //
+  // 只建议、不阻塞：用户想跳过就直接去点大纲（本来就点得到），大纲一做完 status 变 ready，
+  // 这一格自然不再出现——所以「已跳过」不需要记录任何状态。
+  if (needsCharacterSettings(project)) {
+    return {
+      kind: 'action',
+      action: {
+        id: 'status-next-world',
+        kind: 'agent',
+        label: '创建主要角色',
+        description: '建议先创建主要角色，规划大纲时会用到；也可以跳过，直接规划大纲。',
+        enabled: true,
+        command: 'world',
+        prompt: '创建主要角色',
+        target: settingsTabTarget('characters'),
       },
     }
   }
