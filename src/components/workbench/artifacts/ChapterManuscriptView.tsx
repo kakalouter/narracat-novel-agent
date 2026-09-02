@@ -3,7 +3,10 @@ import { toast } from 'sonner'
 import { ChapterPreview } from './ChapterPreview'
 import { ManuscriptEditorView } from './ManuscriptEditorView'
 import { ManuscriptRevisionSheet } from './ManuscriptRevisionSheet'
+import { PolishSetupDialog } from './PolishSetupDialog'
+import { PolishPanel, PolishVersionTabs, type PolishTabValue } from './ChapterPolishVersions'
 import { ImpactEvaluationDock } from '../ImpactEvaluationDock'
+import { BackToTopButton } from '../BackToTopButton'
 import type { MarkdownSelectionHandoff } from './ArtifactDocumentShell'
 import { Button } from '@/components/ui/button'
 import {
@@ -16,8 +19,10 @@ import {
 } from '@/components/ui/dialog'
 import { WORKBENCH_READING_CANVAS_CLASS } from '@/design-system'
 import {
+  clearStandingPolishOutcome,
   discardManuscriptDraft,
   getManuscriptDraft,
+  getPolishSettings,
   saveChapterManuscript,
   saveManuscriptDraft,
 } from '@/lib/ipc'
@@ -30,8 +35,10 @@ import {
   useManuscriptEditorGuard,
 } from '@/lib/manuscript-editor-guard'
 import { usePendingMemorySyncMap } from '@/lib/use-pending-memory-sync'
+import { subscribePolishEvents, usePolishRun } from '@/lib/polish-store'
 import type { NovelArtifact } from '@shared/types/novel'
 import type { ManuscriptDraftState } from '@shared/types/manuscript-draft'
+import type { ProjectPolishSettings } from '@shared/types/prose-polish'
 
 /**
  * 章节正文视图（ADR-0031）：阅读态（ChapterPreview）+ 沉浸整章编辑态 + 保存后分诊浮出
@@ -68,6 +75,9 @@ export function ChapterManuscriptView({
   )
   const [saveCount, setSaveCount] = useState(0)
   const [revisionHistoryOpen, setRevisionHistoryOpen] = useState(false)
+  const [polishOpen, setPolishOpen] = useState(false)
+  const [polishTab, setPolishTab] = useState<PolishTabValue>('original')
+  const [polishSettings, setPolishSettings] = useState<ProjectPolishSettings | null>(null)
   const draftRef = useRef(draft)
   const baseTextRef = useRef(baseText)
   const hydratedDraftKeyRef = useRef('')
@@ -86,8 +96,74 @@ export function ChapterManuscriptView({
   const pendingMap = usePendingMemorySyncMap(projectPath, `${agentBusy}:${saveCount}`)
   const pending = pendingMap[String(chapter)]
 
+  // 润色版本活在正文页（ADR-0041 §10），故事件订阅挂在这里，不挂在配置弹窗上：
+  // 弹窗一关就断订阅的话，跑到一半的版本会永远停在「排队中」。
+  useEffect(() => subscribePolishEvents(), [])
+  const standingVersion = usePolishRun((state) => state.standingVersion)
+
+  // 常驻润色改的是正文文件本身，而正文是父组件传下来的 artifact.content——只重读设置的话，
+  // 会出现「已润色」横幅配着原稿正文。必须把产物也刷一遍。
+  useEffect(() => {
+    if (standingVersion === 0) return
+    onChanged?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [standingVersion])
+
+  // 常驻润色的结果横幅：润过了要说，跳过了更要说——静默跳过会变成「怎么好几章没润色」的哑谜。
+  // 随 agentBusy / saveCount / standingVersion 变化重取。
+  useEffect(() => {
+    let cancelled = false
+    void getPolishSettings(projectPath)
+      .then((settings) => {
+        if (!cancelled) setPolishSettings(settings)
+      })
+      .catch(() => {
+        if (!cancelled) setPolishSettings(null)
+      })
+    return () => {
+      cancelled = true
+    }
+    // standingVersion：常驻润色跑在后台，收尾时只广播一个事件，靠它把这一页叫醒。
+  }, [projectPath, agentBusy, saveCount, standingVersion])
+
+  const polishOrder = usePolishRun((state) => state.order)
+  const polishChapter = usePolishRun((state) => state.chapter)
+  const polishProjectPath = usePolishRun((state) => state.projectPath)
+  const resetPolish = usePolishRun((state) => state.reset)
+  const polishBaseline = usePolishRun((state) => state.baselineText)
+
+  // ⚠️ 这里曾经在 unmount 时清空版本，本意是「切章即丢弃」，实际却是「离开这一页就丢」——
+  // 切到「章节大纲」看一眼再回来，刚跑出来的三版就没了（真机撞出来的）。
+  // 切章本来就有下面的 polishChapter === chapter 守着：别的章不会显示，回到本章又能接着读。
+  // 丢弃只该由两件事触发：作者点「丢弃」，或采用了某一版。
+
+  // 归属必须同时判书和章：只判章号的话，切到另一本书的同章号会显示上一本的版本，
+  // 而采用时用的是当前书的正文当乐观锁基线——那会把别的书的文字写进这本书。
+  const polishActive = polishOrder.length > 0 && polishChapter === chapter && polishProjectPath === projectPath
+  const activePolishSlot = polishActive && polishTab !== 'original' ? polishTab : null
+
+  function discardPolishVersions(): void {
+    // 先停再清：不停的话被丢弃的版本会继续跑完、继续烧 token，
+    // 而 runId 清空之后迟到的事件还可能落进下一轮状态。
+    void usePolishRun.getState().cancelAll()
+    resetPolish()
+    setPolishTab('original')
+  }
+
+  const standingOutcome = polishSettings?.standingOutcomes[String(chapter)] ?? null
+  const diverged = polishSettings?.divergedChapters.includes(chapter) ?? false
+
+  function dismissStandingOutcome(): void {
+    void clearStandingPolishOutcome({ projectPath, chapter })
+      .then(setPolishSettings)
+      .catch((error) => console.error(error))
+  }
+
   const visibleText = extractChapterMetadata(artifact?.content ?? '').content
   const dirty = editing && draft !== baseText
+  // 这几版是照着当时那份正文润的；期间正文若被改过（手改 / Agent 重写 / 常驻润色），
+  // 它们就过期了。不提示的话作者会一路读到点「采用」才撞上乐观锁冲突。
+  const polishStale = polishActive && polishBaseline !== null && polishBaseline !== visibleText
   draftRef.current = draft
   baseTextRef.current = baseText
 
@@ -253,6 +329,7 @@ export function ChapterManuscriptView({
     cancelEdit,
     evaluate: () => evaluate(pending?.reasons ?? []),
     openHistory: () => setRevisionHistoryOpen(true),
+    openPolish: () => setPolishOpen(true),
   })
   latestRef.current = {
     startEdit,
@@ -260,6 +337,7 @@ export function ChapterManuscriptView({
     cancelEdit,
     evaluate: () => evaluate(pending?.reasons ?? []),
     openHistory: () => setRevisionHistoryOpen(true),
+    openPolish: () => setPolishOpen(true),
   }
 
   useEffect(() => {
@@ -269,6 +347,7 @@ export function ChapterManuscriptView({
       cancel: () => latestRef.current.cancelEdit(),
       syncMemory: () => latestRef.current.evaluate(),
       openHistory: () => latestRef.current.openHistory(),
+      openPolish: () => latestRef.current.openPolish(),
       keepDraftBeforeLeave: () => persistDraft(),
       discardDraftBeforeLeave: () => discardDraft(),
     })
@@ -358,6 +437,31 @@ export function ChapterManuscriptView({
 
   return (
     <div className="relative" data-chapter-manuscript-view="true">
+      {standingOutcome && (
+        <div
+          className="mb-3 flex items-center justify-between gap-3 rounded-row border border-border bg-surface px-3 py-2"
+          data-standing-polish-banner={standingOutcome.status}
+        >
+          <p className="min-w-0 text-sm text-muted-foreground">
+            {standingOutcome.status === 'applied'
+              ? '本章已按你的常驻要求润色过，原稿在版本历史里。'
+              : standingOutcome.note ?? '这一章的常驻润色没有生效，已保留原稿。'}
+          </p>
+          <Button type="button" size="sm" variant="secondary" onClick={dismissStandingOutcome}>
+            知道了
+          </Button>
+        </div>
+      )}
+      {diverged && (
+        <div
+          className="mb-3 rounded-row border border-border bg-surface px-3 py-2"
+          data-manuscript-diverged="true"
+        >
+          <p className="text-sm text-muted-foreground">
+            这一章的正文被润色改过情节，记忆库仍按原来的情节记着。后续创作以记忆里的版本为准。
+          </p>
+        </div>
+      )}
       {pending && (
         <div
           className="mb-3 flex items-center justify-between gap-3 rounded-row border border-border bg-surface px-3 py-2"
@@ -369,7 +473,35 @@ export function ChapterManuscriptView({
           </Button>
         </div>
       )}
-      <ChapterPreview artifact={artifact} selectionHandoff={selectionHandoff} leadingContent={leadingContent} />
+      {polishStale && (
+        <div className="mb-3 rounded-row border border-border bg-surface px-3 py-2" data-polish-stale="true">
+          <p className="text-sm text-muted-foreground">
+            正文在这几版跑出来之后又被改过，它们已经对不上了。重新润一次再选。
+          </p>
+        </div>
+      )}
+      {polishActive && (
+        <>
+          <PolishVersionTabs active={polishTab} onChange={setPolishTab} />
+          <PolishPanel
+            active={polishTab}
+            projectPath={projectPath}
+            chapter={chapter}
+            originalText={visibleText}
+            stale={polishStale}
+            onDiscard={discardPolishVersions}
+            onAdopted={() => {
+              setPolishTab('original')
+              handleRevisionRestored()
+            }}
+          />
+        </>
+      )}
+      {activePolishSlot === null && (
+        <ChapterPreview artifact={artifact} selectionHandoff={selectionHandoff} leadingContent={leadingContent} />
+      )}
+      {/* 整章三千字要滚好几屏；读到底部想回头改提示词、切别的版本，不该靠一路滚回去。 */}
+      {polishActive && <BackToTopButton />}
       {impactReasons && (
         <ImpactEvaluationDock
           title="记忆待同步"
@@ -388,6 +520,14 @@ export function ChapterManuscriptView({
         agentBusy={agentBusy}
         draftBlocked={false}
         onRestored={handleRevisionRestored}
+      />
+      <PolishSetupDialog
+        open={polishOpen}
+        onOpenChange={setPolishOpen}
+        projectPath={projectPath}
+        chapter={chapter}
+        originalText={visibleText}
+        onStarted={(slotIds) => setPolishTab(slotIds[0])}
       />
     </div>
   )

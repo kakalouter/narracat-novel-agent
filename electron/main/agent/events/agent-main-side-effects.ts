@@ -32,6 +32,11 @@ export interface AgentMainSideEffectsDeps {
   resolveProjectName: (projectPath: string) => Promise<string>
   clearPendingMemorySync: (projectPath: string, chapter: number) => Promise<void>
   onChapterWriteEvent?: (event: ChapterWriteTelemetryEvent) => void
+  /**
+   * 写章节成功收场后的钩子（ADR-0041 常驻润色的挂载点）。
+   * 复用这一层已有的 run 终态判定，不在 run-manager 里另钉一套生命周期。
+   */
+  onChapterWriteCompleted?: (input: { projectPath: string; startedAt: string; finishedAt: string }) => void
 }
 
 function fallbackProjectName(projectPath: string | undefined): string {
@@ -249,6 +254,22 @@ export function createAgentMainSideEffects(deps: AgentMainSideEffectsDeps) {
       operations.push(() =>
         retryOnce(() => deps.clearPendingMemorySync(projectPath, selectedChapter)),
       )
+    }
+    // recover-write 与 write-next 同样产出正文（两条 run 路径都标 manuscriptRevisionSource:
+    // 'agent-write'），只判前者会让「恢复写作」写出来的新章拿不到常驻润色。
+    if (
+      payload.type === 'run.completed' &&
+      (run.command === 'write-next' || run.command === 'recover-write') &&
+      run.projectPath
+    ) {
+      const projectPath = run.projectPath
+      // 旁路：常驻润色失败绝不影响通知与写作链路收尾，故不进 runIndependentSideEffects。
+      try {
+        // 带上 run 的起止时刻：写作命令有「先不写」这条出口，run 照样正常结束，
+        // 下游据此判断这一章的正文是不是真的在**本次 run 期间**落盘。两头都要——只判起点的话，
+        // 下一轮很快写出的正文也会被这一轮迟到的常驻检查错认成自己的。
+        deps.onChapterWriteCompleted?.({ projectPath, startedAt: run.startedAt, finishedAt: payload.createdAt })
+      } catch {}
     }
     operations.push(() => deps.showNativeNotification(notification))
     await runIndependentSideEffects(operations)
